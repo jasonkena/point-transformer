@@ -17,20 +17,51 @@ import torch.distributed as dist
 import torch.optim.lr_scheduler as lr_scheduler
 from tensorboardX import SummaryWriter
 
+import os
+import sys
+sys.path.append("/data/adhinart/freseg")
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from frenet import get_dataloader
+
 from util import config
-from util.s3dis import S3DIS
 from util.common_util import AverageMeter, intersectionAndUnionGPU, find_free_port
-from util.data_util import collate_fn
 from util import transform as t
 
 
+def weird_collate(trunk_id, points, target):
+    # see https://github.com/POSTECH-CVLab/point-transformer/blob/10d43ab5210fc93ffa15886f2a4c6460cc308780/util/data_util.py#L16C1-L23C88
+    # transforms points: [B, N, 3] -> [B*N, 3], target: [B, N] -> [B*N]
+    # outputs offsets 
+    B, N, _ = points.shape
+    coord = points.reshape(-1, 3).float()
+    feat = coord
+    target = target.reshape(-1)
+    offset = torch.arange(1, B+1) * N 
+    offset = offset.to(target.device).int()
+
+    return coord, feat, target, offset
+
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch Point Cloud Semantic Segmentation')
-    parser.add_argument('--config', type=str, default='config/s3dis/s3dis_pointtransformer_repro.yaml', help='config file')
+    parser.add_argument('--config', type=str, default='config/freseg/freseg.yaml', help='config file')
     parser.add_argument('opts', help='see config/s3dis/s3dis_pointtransformer_repro.yaml for all options', default=None, nargs=argparse.REMAINDER)
+    parser.add_argument("--npoint", type=int, help="path length")
+    parser.add_argument("--path_length", type=int, help="path length")
+    parser.add_argument("--fold", type=int, help="fold")
+    parser.add_argument(
+        "--frenet", action="store_true", help="whether to use Frenet transformation"
+    )
+
     args = parser.parse_args()
     assert args.config is not None
     cfg = config.load_cfg_from_cfg_file(args.config)
+    cfg.npoint = args.npoint
+    cfg.path_length = args.path_length
+    cfg.fold = args.fold
+    cfg.frenet = args.frenet
+    cfg.save_path = "exp/freseg/{}_{}_{}_{}".format(args.fold, args.path_length, args.npoint, args.frenet)
+
     if args.opts is not None:
         cfg = config.merge_cfg_from_list(cfg, args.opts)
     return cfg
@@ -76,11 +107,6 @@ def main():
         args.distributed = False
         args.multiprocessing_distributed = False
 
-    if args.data_name == 's3dis':
-        S3DIS(split='train', data_root=args.data_root, test_area=args.test_area)
-        S3DIS(split='val', data_root=args.data_root, test_area=args.test_area)
-    else:
-        raise NotImplementedError()
     if args.multiprocessing_distributed:
         port = find_free_port()
         args.dist_url = f"tcp://localhost:{port}"
@@ -107,7 +133,7 @@ def main_worker(gpu, ngpus_per_node, argss):
     model = Model(c=args.fea_dim, k=args.classes)
     if args.sync_bn:
        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_label).cuda()
+    criterion = nn.CrossEntropyLoss().cuda()
 
     optimizer = torch.optim.SGD(model.parameters(), lr=args.base_lr, momentum=args.momentum, weight_decay=args.weight_decay)
     scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[int(args.epochs*0.6), int(args.epochs*0.8)], gamma=0.1)
@@ -162,29 +188,33 @@ def main_worker(gpu, ngpus_per_node, argss):
             if main_process():
                 logger.info("=> no checkpoint found at '{}'".format(args.resume))
 
-    train_transform = t.Compose([t.RandomScale([0.9, 1.1]), t.ChromaticAutoContrast(), t.ChromaticTranslation(), t.ChromaticJitter(), t.HueSaturationTranslation()])
-    train_data = S3DIS(split='train', data_root=args.data_root, test_area=args.test_area, voxel_size=args.voxel_size, voxel_max=args.voxel_max, transform=train_transform, shuffle_index=True, loop=args.loop)
-    if main_process():
-            logger.info("train_data samples: '{}'".format(len(train_data)))
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_data)
-    else:
-        train_sampler = None
-    train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=(train_sampler is None), num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True, collate_fn=collate_fn)
+    train_loader, _ = get_dataloader(
+        species="seg_den",
+        path_length=args.path_length,
+        num_points=args.npoint,
+        fold=args.fold,
+        is_train=True,
+        batch_size=args.batch_size,
+        num_workers=args.workers,
+        frenet=args.frenet,
+        distributed=args.distributed,
+    )
 
-    val_loader = None
-    if args.evaluate:
-        val_transform = None
-        val_data = S3DIS(split='val', data_root=args.data_root, test_area=args.test_area, voxel_size=args.voxel_size, voxel_max=800000, transform=val_transform)
-        if args.distributed:
-            val_sampler = torch.utils.data.distributed.DistributedSampler(val_data)
-        else:
-            val_sampler = None
-        val_loader = torch.utils.data.DataLoader(val_data, batch_size=args.batch_size_val, shuffle=False, num_workers=args.workers, pin_memory=True, sampler=val_sampler, collate_fn=collate_fn)
+    val_loader, _ = get_dataloader(
+        species="seg_den",
+        path_length=args.path_length,
+        num_points=args.npoint,
+        fold=args.fold,
+        is_train=False,
+        batch_size=args.batch_size,
+        num_workers=args.workers,
+        frenet=args.frenet,
+        distributed=args.distributed,
+    )
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
-            train_sampler.set_epoch(epoch)
+            train_loader.sampler.set_epoch(epoch)
         loss_train, mIoU_train, mAcc_train, allAcc_train = train(train_loader, model, criterion, optimizer, epoch)
         scheduler.step()
         epoch_log = epoch + 1
@@ -211,6 +241,8 @@ def main_worker(gpu, ngpus_per_node, argss):
 
         if (epoch_log % args.save_freq == 0) and main_process():
             filename = args.save_path + '/model/model_last.pth'
+            if not os.path.exists(args.save_path + '/model'):
+                os.makedirs(args.save_path + '/model')
             logger.info('Saving checkpoint to: ' + filename)
             torch.save({'epoch': epoch_log, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict(),
                         'scheduler': scheduler.state_dict(), 'best_iou': best_iou, 'is_best': is_best}, filename)
@@ -234,7 +266,9 @@ def train(train_loader, model, criterion, optimizer, epoch):
     model.train()
     end = time.time()
     max_iter = args.epochs * len(train_loader)
-    for i, (coord, feat, target, offset) in enumerate(train_loader):  # (n, 3), (n, c), (n), (b)
+    for i, (trunk_id, points, target) in enumerate(train_loader):
+        coord, feat, target, offset = weird_collate(trunk_id, points, target) # (n, 3), (n, c), (n), (b)
+        target = (target > 0).type(target.dtype)
         data_time.update(time.time() - end)
         coord, feat, target, offset = coord.cuda(non_blocking=True), feat.cuda(non_blocking=True), target.cuda(non_blocking=True), offset.cuda(non_blocking=True)
         output = model([coord, feat, offset])
@@ -311,7 +345,9 @@ def validate(val_loader, model, criterion):
 
     model.eval()
     end = time.time()
-    for i, (coord, feat, target, offset) in enumerate(val_loader):
+    for i, (trunk_id, points, target) in enumerate(val_loader):
+        coord, feat, target, offset = weird_collate(trunk_id, points, target) # (n, 3), (n, c), (n), (b)
+        target = (target > 0).type(target.dtype)
         data_time.update(time.time() - end)
         coord, feat, target, offset = coord.cuda(non_blocking=True), feat.cuda(non_blocking=True), target.cuda(non_blocking=True), offset.cuda(non_blocking=True)
         if target.shape[-1] == 1:

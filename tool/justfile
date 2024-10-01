@@ -1,0 +1,10 @@
+default:
+    just --list
+
+# pathlength 10000 npoints 4096
+train fold pathlength npoints:
+    python train.py --fold {{fold}} --path_length {{pathlength}} --npoint {{npoints}} --config /data/adhinart/freseg/point-transformer/config/freseg/freseg.yaml
+
+train_frenet fold pathlength npoints:
+    python train.py --fold {{fold}} --path_length {{pathlength}} --npoint {{npoints}} --config /data/adhinart/freseg/point-transformer/config/freseg/freseg.yaml
+
