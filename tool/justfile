@@ -6,5 +6,12 @@ train fold pathlength npoints:
     python train.py --fold {{fold}} --path_length {{pathlength}} --npoint {{npoints}} --config /data/adhinart/freseg/point-transformer/config/freseg/freseg.yaml
 
 train_frenet fold pathlength npoints:
-    python train.py --fold {{fold}} --path_length {{pathlength}} --npoint {{npoints}} --config /data/adhinart/freseg/point-transformer/config/freseg/freseg.yaml
+    python train.py --fold {{fold}} --path_length {{pathlength}} --npoint {{npoints}} --config /data/adhinart/freseg/point-transformer/config/freseg/freseg.yaml --frenet
+
+# pathlength 10000 npoints 4096
+evaluate cuda fold pathlength npoints:
+    CUDA_VISIBLE_DEVICES={{cuda}} python inference.py --fold {{fold}} --path_length {{pathlength}} --npoint {{npoints}}
+
+evaluate_frenet cuda fold pathlength npoints:
+    CUDA_VISIBLE_DEVICES={{cuda}} python inference.py --fold {{fold}} --path_length {{pathlength}} --npoint {{npoints}} --frenet
 
